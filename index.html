@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <title>Safety Document Assistant</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #fff; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    input, textarea, button { font-family: inherit; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const store = {
+      get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+      set: (k, v) => { try { localStorage.setItem(k, v); } catch { alert("Storage full. Try removing a document."); } },
+      remove: (k) => { try { localStorage.removeItem(k); } catch {} }
+    };
+
+    function App() {
+      const [apiKey, setApiKey] = useState("");
+      const [apiKeySaved, setApiKeySaved] = useState(false);
+      const [showKeyInput, setShowKeyInput] = useState(false);
+      const [savedDocs, setSavedDocs] = useState([]);
+      const [question, setQuestion] = useState("");
+      const [photo, setPhoto] = useState(null);
+      const [photoName, setPhotoName] = useState("");
+      const [answer, setAnswer] = useState(null);
+      const [isListening, setIsListening] = useState(false);
+      const [isLoading, setIsLoading] = useState(false);
+      const [isSpeaking, setIsSpeaking] = useState(false);
+      const [status, setStatus] = useState("");
+      const [sessionLog, setSessionLog] = useState([]);
+      const [view, setView] = useState("ask");
+      const [summaryText, setSummaryText] = useState("");
+      const [summaryLoading, setSummaryLoading] = useState(false);
+      const recognitionRef = useRef(null);
+
+      useEffect(() => {
+        const key = store.get("safety-api-key");
+        if (key) { setApiKey(key); setApiKeySaved(true); } else { setShowKeyInput(true); }
+        try {
+          const docs = store.get("safety-docs");
+          if (docs) setSavedDocs(JSON.parse(docs));
+        } catch {}
+      }, []);
+
+      const saveApiKey = () => {
+        if (!apiKey.trim()) return;
+        store.set("safety-api-key", apiKey.trim());
+        setApiKeySaved(true);
+        setShowKeyInput(false);
+      };
+
+      const fileToBase64 = (file) => new Promise((res, rej) => {
+        const r = new FileReader();
+        r.onload = () => res(r.result.split(",")[1]);
+        r.onerror = rej;
+        r.readAsDataURL(file);
+      });
+
+      const handleDocs = async (e) => {
+        const selected = Array.from(e.target.files);
+        setStatus("Saving documents...");
+        const newDocs = [];
+        for (const file of selected) {
+          const b64 = await fileToBase64(file);
+          newDocs.push({ name: file.name, data: b64 });
+        }
+        const merged = [...savedDocs.filter(d => !newDocs.find(n => n.name === d.name)), ...newDocs];
+        setSavedDocs(merged);
+        store.set("safety-docs", JSON.stringify(merged));
+        setStatus("Documents saved.");
+        setTimeout(() => setStatus(""), 2500);
+      };
+
+      const removeDoc = (name) => {
+        const updated = savedDocs.filter(d => d.name !== name);
+        setSavedDocs(updated);
+        store.set("safety-docs", JSON.stringify(updated));
+      };
+
+      const handlePhoto = async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const b64 = await fileToBase64(file);
+        setPhoto(b64);
+        setPhotoName(file.name);
+      };
+
+      const clearPhoto = () => { setPhoto(null); setPhotoName(""); };
+
+      const startListening = () => {
+        const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SR) { alert("Speech recognition not supported. Please type your question."); return; }
+        const r = new SR();
+        r.lang = "en-US"; r.continuous = false; r.interimResults = false;
+        r.onresult = (e) => { setQuestion(e.results[0][0].transcript); setIsListening(false); };
+        r.onerror = () => setIsListening(false);
+        r.onend = () => setIsListening(false);
+        recognitionRef.current = r;
+        r.start();
+        setIsListening(true);
+      };
+
+      const stopListening = () => { recognitionRef.current?.stop(); setIsListening(false); };
+
+      const callClaude = async (content, maxTokens = 1500) => {
+        const res = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+          body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: maxTokens, messages: [{ role: "user", content }] })
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error.message);
+        return data.content[0].text;
+      };
+
+      const parseAnswer = (text) => {
+        const fields = {};
+        const lines = text.split("\n");
+        let currentKey = null;
+        let currentVal = [];
+        const knownKeys = ["SEVERITY", "VIOLATION", "WHY THIS IS A VIOLATION", "FINDING", "DETAIL", "CORRECTIVE ACTION", "REFERENCE"];
+        for (const line of lines) {
+          const matchedKey = knownKeys.find(k => line.toUpperCase().startsWith(k + ":"));
+          if (matchedKey) {
+            if (currentKey) fields[currentKey] = currentVal.join(" ").trim();
+            currentKey = matchedKey;
+            currentVal = [line.slice(matchedKey.length + 1).trim()];
+          } else if (currentKey && line.trim()) {
+            currentVal.push(line.trim());
+          }
+        }
+        if (currentKey) fields[currentKey] = currentVal.join(" ").trim();
+        return fields;
+      };
+
+      const askQuestion = async () => {
+        if (!question.trim() && !photo) { alert("Please speak a question or upload a photo."); return; }
+        if (!apiKey) { alert("Please enter your API key."); setShowKeyInput(true); return; }
+        setIsLoading(true);
+        setAnswer(null);
+        window.speechSynthesis.cancel();
+
+        try {
+          const content = [];
+
+          // Add PDFs
+          for (const doc of savedDocs) {
+            content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: doc.data } });
+          }
+
+          // Add photo if present
+          if (photo) {
+            content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: photo } });
+          }
+
+          const hasPhoto = !!photo;
+          const hasQuestion = !!question.trim();
+          const hasDocs = savedDocs.length > 0;
+
+          const promptText = `You are a food safety and workplace safety compliance expert with deep knowledge of FDA Food Code, OSHA regulations, and retail grocery standards.
+
+${hasPhoto ? "The user has uploaded a photo of a potential violation." : ""}
+${hasQuestion ? `The user's question: ${question}` : ""}
+
+${hasDocs ? "Cross-reference the provided documents to support your answer." : "Use your knowledge of standard food safety and OSHA regulations."}
+
+Respond in exactly this format (include all fields even if brief):
+
+SEVERITY: [Critical / Major / Minor / Not a Violation]
+${hasPhoto ? "VIOLATION: [Name or type of violation observed]\nWHY THIS IS A VIOLATION: [Explain the specific health risk, regulatory basis, or food code section that makes this a violation. Be specific about the risk to customers or employees.]\n" : ""}FINDING: [One clear sentence summarizing the issue or answer]
+DETAIL: [Thorough explanation. If this is a violation, describe exactly what is wrong, what the risk is, and reference any relevant code or policy from the documents.]
+CORRECTIVE ACTION: [Step-by-step specific actions required to correct the issue immediately and prevent recurrence]
+REFERENCE: [Document name and section, or FDA Food Code section, or OSHA standard number]`;
+
+          content.push({ type: "text", text: promptText });
+
+          const text = await callClaude(content);
+          const parsed = parseAnswer(text);
+          parsed._raw = text;
+          setAnswer(parsed);
+
+          const logEntry = {
+            question: question || (photo ? "Photo analysis" : ""),
+            severity: parsed["SEVERITY"] || "",
+            finding: parsed["FINDING"] || "",
+            violation: parsed["VIOLATION"] || "",
+            detail: parsed["DETAIL"] || "",
+            corrective: parsed["CORRECTIVE ACTION"] || "",
+            why: parsed["WHY THIS IS A VIOLATION"] || "",
+            reference: parsed["REFERENCE"] || "",
+            hasPhoto,
+            time: new Date().toLocaleTimeString()
+          };
+          setSessionLog(prev => [...prev, logEntry]);
+
+          const speakText = [
+            parsed["SEVERITY"] ? `Severity: ${parsed["SEVERITY"]}.` : "",
+            parsed["VIOLATION"] ? `Violation: ${parsed["VIOLATION"]}.` : "",
+            parsed["FINDING"] || "",
+            parsed["WHY THIS IS A VIOLATION"] ? `Why this is a violation: ${parsed["WHY THIS IS A VIOLATION"]}` : "",
+            parsed["CORRECTIVE ACTION"] ? `Corrective action: ${parsed["CORRECTIVE ACTION"]}` : ""
+          ].filter(Boolean).join(" ");
+
+          const utt = new SpeechSynthesisUtterance(speakText);
+          utt.rate = 0.9;
+          utt.onend = () => setIsSpeaking(false);
+          setIsSpeaking(true);
+          window.speechSynthesis.speak(utt);
+
+        } catch (e) {
+          setAnswer({ _raw: `Error: ${e.message}` });
+        }
+        setIsLoading(false);
+      };
+
+      const generateSummary = async () => {
+        if (sessionLog.length === 0) { alert("No findings yet in this session."); return; }
+        setSummaryLoading(true);
+        setSummaryText("");
+        try {
+          const logText = sessionLog.map((item, i) =>
+            `Finding ${i + 1} [${item.time}]:\nQuestion/Observation: ${item.question}\nSeverity: ${item.severity}\nViolation: ${item.violation || "N/A"}\nFinding: ${item.finding}\nWhy: ${item.why || "N/A"}\nCorrective Action: ${item.corrective}\nReference: ${item.reference}`
+          ).join("\n\n---\n\n");
+
+          const content = [{ type: "text", text: `You are a food safety compliance manager. Generate a professional Store Walk Compliance Report based on the following findings.
+
+Format the report as follows:
+- Store Walk Report header with today's date: ${new Date().toLocaleDateString()}
+- Executive Summary (2-3 sentences on overall compliance)
+- Total Findings: X (Critical: X, Major: X, Minor: X)
+- Findings listed by severity (Critical first), each with: finding number, severity, what was observed, why it is a violation, and required corrective action
+- Immediate Action Items (anything Critical or Major that needs same-day correction)
+- Follow-up Items (Minor findings)
+- Overall Compliance Assessment
+
+Today's findings:
+${logText}` }];
+
+          const text = await callClaude(content, 2048);
+          setSummaryText(text);
+        } catch (e) { setSummaryText(`Error: ${e.message}`); }
+        setSummaryLoading(false);
+      };
+
+      const saveAsPDF = () => {
+        if (!summaryText) { alert("Generate a summary first."); return; }
+        const date = new Date().toLocaleDateString();
+        const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Store Walk Report - ${date}</title>
+        <style>body{font-family:-apple-system,Arial,sans-serif;padding:40px;max-width:720px;margin:0 auto;color:#111;line-height:1.6}h1{font-size:24px;font-weight:700;margin-bottom:4px}p{margin:6px 0;font-size:15px}.divider{border:none;border-top:1px solid #e5e7eb;margin:14px 0}@media print{body{padding:20px}}</style>
+        </head><body>${summaryText.split("\n").map(l => l.trim() ? `<p>${l}</p>` : "<hr class='divider'>").join("")}</body></html>`;
+        const win = window.open("", "_blank");
+        win.document.write(html);
+        win.document.close();
+        setTimeout(() => { win.focus(); win.print(); }, 400);
+      };
+
+      const stopSpeaking = () => { window.speechSynthesis.cancel(); setIsSpeaking(false); };
+      const clearAll = () => { setQuestion(""); setAnswer(null); clearPhoto(); stopSpeaking(); };
+
+      const sevColor = (s) => {
+        if (!s) return "#111";
+        const sl = s.toLowerCase();
+        if (sl.includes("critical")) return "#b91c1c";
+        if (sl.includes("major")) return "#b45309";
+        if (sl.includes("minor")) return "#1d4ed8";
+        return "#166534";
+      };
+      const sevBg = (s) => {
+        if (!s) return "#f9fafb";
+        const sl = s.toLowerCase();
+        if (sl.includes("critical")) return "#fef2f2";
+        if (sl.includes("major")) return "#fffbeb";
+        if (sl.includes("minor")) return "#eff6ff";
+        return "#f0fdf4";
+      };
+
+      const Field = ({ label, value }) => value ? (
+        <div style={{ marginBottom: "16px" }}>
+          <div style={{ fontSize: "11px", fontWeight: "700", color: "#9ca3af", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: "3px" }}>{label}</div>
+          <div style={{ fontSize: "15px", color: "#111", lineHeight: "1.65" }}>{value}</div>
+        </div>
+      ) : null;
+
+      const card = { padding: "16px", border: "1px solid #e5e7eb", borderRadius: "10px", marginBottom: "16px" };
+      const navBtn = (label, target) => (
+        <button onClick={() => { setView(target); if (target === "summary" && !summaryText && sessionLog.length > 0) generateSummary(); }}
+          style={{ padding: "10px 16px", borderRadius: "8px", border: view === target ? "2px solid #111" : "1px solid #d1d5db", background: view === target ? "#111" : "#fff", color: view === target ? "#fff" : "#374151", fontSize: "14px", fontWeight: view === target ? "700" : "400", cursor: "pointer" }}>
+          {label}
+        </button>
+      );
+
+      return (
+        <div style={{ minHeight: "100vh", background: "#fff", padding: "24px 16px", maxWidth: "580px", margin: "0 auto" }}>
+
+          <h1 style={{ fontSize: "20px", fontWeight: "700", marginBottom: "2px" }}>Safety Document Assistant</h1>
+          <p style={{ fontSize: "13px", color: "#6b7280", marginBottom: "20px" }}>Store walk compliance tool</p>
+
+          <div style={{ display: "flex", gap: "8px", marginBottom: "24px" }}>
+            {navBtn("Ask / Analyze", "ask")}
+            {navBtn(`Summary${sessionLog.length > 0 ? ` (${sessionLog.length})` : ""}`, "summary")}
+          </div>
+
+          {/* API Key */}
+          {showKeyInput ? (
+            <div style={card}>
+              <div style={{ fontSize: "13px", fontWeight: "600", marginBottom: "4px" }}>Anthropic API Key</div>
+              <div style={{ fontSize: "12px", color: "#9ca3af", marginBottom: "10px" }}>Enter once — saved to this device permanently.</div>
+              <input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder="sk-ant-..." style={{ width: "100%", padding: "10px 12px", borderRadius: "8px", border: "1px solid #d1d5db", fontSize: "14px", marginBottom: "10px" }} />
+              <button onClick={saveApiKey} style={{ width: "100%", padding: "12px", borderRadius: "8px", border: "none", background: "#111", color: "#fff", fontSize: "15px", fontWeight: "600", cursor: "pointer" }}>Save Key</button>
+            </div>
+          ) : (
+            <div style={{ ...card, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: "13px" }}>API key saved</span>
+              <button onClick={() => setShowKeyInput(true)} style={{ background: "none", border: "none", color: "#6b7280", fontSize: "12px", cursor: "pointer", textDecoration: "underline" }}>Change</button>
+            </div>
+          )}
+
+          {/* Documents */}
+          <div style={card}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+              <div style={{ fontSize: "13px", fontWeight: "600" }}>Documents ({savedDocs.length})</div>
+              <label style={{ fontSize: "13px", fontWeight: "600", cursor: "pointer", textDecoration: "underline" }}>
+                Add PDF
+                <input type="file" accept=".pdf" multiple onChange={handleDocs} style={{ display: "none" }} />
+              </label>
+            </div>
+            {savedDocs.length === 0
+              ? <div style={{ fontSize: "13px", color: "#9ca3af" }}>No documents loaded. Add your safety PDFs — saved permanently to this device.</div>
+              : savedDocs.map((d, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: i < savedDocs.length - 1 ? "1px solid #f3f4f6" : "none" }}>
+                  <span style={{ fontSize: "13px", color: "#374151", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "80%" }}>{d.name}</span>
+                  <button onClick={() => removeDoc(d.name)} style={{ background: "none", border: "none", color: "#9ca3af", fontSize: "12px", cursor: "pointer" }}>Remove</button>
+                </div>
+              ))
+            }
+            {status && <div style={{ fontSize: "12px", color: "#6b7280", marginTop: "8px" }}>{status}</div>}
+          </div>
+
+          {/* ASK VIEW */}
+          {view === "ask" && (
+            <>
+              <div style={card}>
+                <div style={{ fontSize: "13px", fontWeight: "600", marginBottom: "10px" }}>Question</div>
+                <button onClick={isListening ? stopListening : startListening}
+                  style={{ width: "100%", padding: "14px", borderRadius: "8px", border: "1px solid #d1d5db", background: isListening ? "#fef2f2" : "#f9fafb", color: isListening ? "#b91c1c" : "#374151", fontSize: "15px", cursor: "pointer", marginBottom: "10px", fontWeight: "600" }}>
+                  {isListening ? "Listening — tap to stop" : "Tap to speak"}
+                </button>
+                <textarea value={question} onChange={e => setQuestion(e.target.value)} placeholder="Or type your question here..." style={{ width: "100%", padding: "10px 12px", borderRadius: "8px", border: "1px solid #d1d5db", fontSize: "14px", minHeight: "80px", resize: "vertical" }} />
+              </div>
+
+              <div style={card}>
+                <div style={{ fontSize: "13px", fontWeight: "600", marginBottom: "4px" }}>Photo of Violation (optional)</div>
+                <div style={{ fontSize: "12px", color: "#9ca3af", marginBottom: "10px" }}>Upload a photo to get a visual analysis of the violation, why it fails code, and how to correct it.</div>
+                {photo ? (
+                  <div>
+                    <img src={`data:image/jpeg;base64,${photo}`} alt="Violation" style={{ width: "100%", maxHeight: "220px", objectFit: "cover", borderRadius: "8px", marginBottom: "8px" }} />
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ fontSize: "12px", color: "#374151" }}>{photoName}</span>
+                      <button onClick={clearPhoto} style={{ background: "none", border: "none", color: "#9ca3af", fontSize: "12px", cursor: "pointer" }}>Remove</button>
+                    </div>
+                  </div>
+                ) : (
+                  <label style={{ display: "block", padding: "14px", borderRadius: "8px", border: "2px dashed #d1d5db", textAlign: "center", cursor: "pointer", color: "#9ca3af", fontSize: "14px" }}>
+                    Tap to upload photo
+                    <input type="file" accept="image/*" capture="environment" onChange={handlePhoto} style={{ display: "none" }} />
+                  </label>
+                )}
+              </div>
+
+              <button onClick={askQuestion} disabled={isLoading || (!question.trim() && !photo)}
+                style={{ width: "100%", padding: "16px", borderRadius: "10px", border: "none", background: isLoading || (!question.trim() && !photo) ? "#e5e7eb" : "#111", color: isLoading || (!question.trim() && !photo) ? "#9ca3af" : "#fff", fontSize: "16px", fontWeight: "700", cursor: isLoading || (!question.trim() && !photo) ? "not-allowed" : "pointer", marginBottom: "16px" }}>
+                {isLoading ? "Analyzing..." : "Get Answer"}
+              </button>
+
+              {answer && (
+                <div style={card}>
+                  {answer["SEVERITY"] && (
+                    <div style={{ display: "inline-block", padding: "4px 12px", borderRadius: "20px", background: sevBg(answer["SEVERITY"]), border: `1px solid ${sevColor(answer["SEVERITY"])}`, marginBottom: "16px" }}>
+                      <span style={{ fontSize: "12px", fontWeight: "700", color: sevColor(answer["SEVERITY"]), textTransform: "uppercase", letterSpacing: "0.05em" }}>{answer["SEVERITY"]}</span>
+                    </div>
+                  )}
+                  <Field label="Violation" value={answer["VIOLATION"]} />
+                  <Field label="Why This Is a Violation" value={answer["WHY THIS IS A VIOLATION"]} />
+                  <Field label="Finding" value={answer["FINDING"]} />
+                  <Field label="Detail" value={answer["DETAIL"]} />
+                  <Field label="Corrective Action" value={answer["CORRECTIVE ACTION"]} />
+                  <Field label="Reference" value={answer["REFERENCE"]} />
+                  {!answer["SEVERITY"] && answer["_raw"] && (
+                    <div style={{ fontSize: "15px", lineHeight: "1.65", color: "#111" }}>{answer["_raw"]}</div>
+                  )}
+                  <div style={{ display: "flex", gap: "8px", marginTop: "12px" }}>
+                    {isSpeaking && <button onClick={stopSpeaking} style={{ padding: "8px 14px", borderRadius: "6px", border: "1px solid #d1d5db", fontSize: "13px", cursor: "pointer" }}>Stop speaking</button>}
+                    <button onClick={clearAll} style={{ padding: "8px 14px", borderRadius: "6px", border: "1px solid #d1d5db", fontSize: "13px", cursor: "pointer" }}>Clear</button>
+                  </div>
+                </div>
+              )}
+
+              {sessionLog.length > 0 && <div style={{ fontSize: "12px", color: "#9ca3af", textAlign: "center" }}>{sessionLog.length} finding{sessionLog.length > 1 ? "s" : ""} logged this session</div>}
+            </>
+          )}
+
+          {/* SUMMARY VIEW */}
+          {view === "summary" && (
+            <>
+              {sessionLog.length === 0 ? (
+                <div style={{ ...card, textAlign: "center" }}>
+                  <div style={{ fontSize: "15px", color: "#6b7280" }}>No findings yet. Ask questions or analyze photos during your store walk and they will appear here.</div>
+                </div>
+              ) : (
+                <>
+                  <div style={{ display: "flex", gap: "8px", marginBottom: "16px" }}>
+                    <button onClick={generateSummary} disabled={summaryLoading} style={{ flex: 1, padding: "12px", borderRadius: "8px", border: "1px solid #d1d5db", background: "#f9fafb", fontSize: "14px", fontWeight: "600", cursor: summaryLoading ? "not-allowed" : "pointer" }}>
+                      {summaryLoading ? "Generating..." : summaryText ? "Regenerate" : "Generate Summary"}
+                    </button>
+                    <button onClick={saveAsPDF} disabled={!summaryText} style={{ flex: 1, padding: "12px", borderRadius: "8px", border: "none", background: !summaryText ? "#e5e7eb" : "#111", color: !summaryText ? "#9ca3af" : "#fff", fontSize: "14px", fontWeight: "600", cursor: !summaryText ? "not-allowed" : "pointer" }}>
+                      Save as PDF
+                    </button>
+                  </div>
+
+                  {summaryText && (
+                    <div style={card}>
+                      {summaryText.split("\n").map((line, i) =>
+                        line.trim()
+                          ? <div key={i} style={{ fontSize: "14px", lineHeight: "1.7", color: "#111", marginBottom: "4px" }}>{line}</div>
+                          : <div key={i} style={{ height: "10px" }} />
+                      )}
+                    </div>
+                  )}
+
+                  <div style={{ fontSize: "13px", fontWeight: "600", color: "#374151", marginBottom: "10px" }}>All findings this session</div>
+                  {sessionLog.map((item, i) => (
+                    <div key={i} style={{ ...card, marginBottom: "8px" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "6px" }}>
+                        <span style={{ fontSize: "12px", fontWeight: "700", color: sevColor(item.severity), textTransform: "uppercase" }}>{item.severity || "—"}</span>
+                        <span style={{ fontSize: "11px", color: "#9ca3af" }}>{item.time}</span>
+                      </div>
+                      {item.violation && <div style={{ fontSize: "13px", fontWeight: "600", color: "#111", marginBottom: "2px" }}>{item.violation}</div>}
+                      <div style={{ fontSize: "13px", color: "#6b7280" }}>{item.question || "Photo analysis"}</div>
+                      {item.finding && <div style={{ fontSize: "13px", color: "#374151", marginTop: "4px" }}>{item.finding}</div>}
+                    </div>
+                  ))}
+                </>
+              )}
+            </>
+          )}
+
+          <div style={{ fontSize: "11px", color: "#e5e7eb", textAlign: "center", marginTop: "24px", paddingBottom: "24px" }}>API key and documents saved to this device</div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
